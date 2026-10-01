@@ -1,0 +1,71 @@
+{
+  "travel_feed": "1800",
+  "cup": null,
+  "lines": [
+    {
+      "kind": "dot",
+      "axis": "Y",
+      "start_x": -85.75,
+      "start_y": -83.5,
+      "length": 30.0,
+      "feed": 1000.0,
+      "reps": 1,
+      "pause_s": 0.0,
+      "dwell_s": 0.1,
+      "feed_end": 0.0,
+      "gradient_mode": "velocity"
+    },
+    {
+      "kind": "line_back",
+      "axis": "Y",
+      "start_x": -41.25,
+      "start_y": -83.5,
+      "length": 25.0,
+      "feed": 1000.0,
+      "reps": 1,
+      "pause_s": 0.0,
+      "dwell_s": 1.0,
+      "feed_end": 2000.0,
+      "gradient_mode": "velocity"
+    },
+    {
+      "kind": "line_back",
+      "axis": "Y",
+      "start_x": -26.25,
+      "start_y": -83.5,
+      "length": 25.0,
+      "feed": 1000.0,
+      "reps": 1,
+      "pause_s": 0.0,
+      "dwell_s": 1.0,
+      "feed_end": 2000.0,
+      "gradient_mode": "velocity"
+    },
+    {
+      "kind": "line_back",
+      "axis": "Y",
+      "start_x": -11.25,
+      "start_y": -83.5,
+      "length": 25.0,
+      "feed": 1000.0,
+      "reps": 1,
+      "pause_s": 0.0,
+      "dwell_s": 1.0,
+      "feed_end": 2000.0,
+      "gradient_mode": "velocity"
+    },
+    {
+      "kind": "dot",
+      "axis": "Y",
+      "start_x": -85.75,
+      "start_y": -83.5,
+      "length": 30.0,
+      "feed": 1000.0,
+      "reps": 1,
+      "pause_s": 0.0,
+      "dwell_s": 0.1,
+      "feed_end": 0.0,
+      "gradient_mode": "velocity"
+    }
+  ]
+}

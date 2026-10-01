@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+# PyInstaller regenerates this from packaging/build_macos.sh
+*.spec
+
+# Virtual envs
+.venv/
+
+# Built bundles, wherever they end up. The .app is 395 files of binary
+# rebuilt from source in a minute; it does not belong in history.
+*.app/
+
+# macOS
+.DS_Store

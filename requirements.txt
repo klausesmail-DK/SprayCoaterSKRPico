@@ -1,0 +1,2 @@
+pyserial>=3.5
+mpremote>=1.23
