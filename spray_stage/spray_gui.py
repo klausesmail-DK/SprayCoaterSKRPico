@@ -45,6 +45,7 @@ from .stage import (  # the machine model, importable without Tkinter
     DEFAULT_MIN_X,
     DEFAULT_MIN_Y,
     DEFAULT_PULLOFF,
+    DEFAULT_TRAVEL_FEED,
     Envelope,
     GRADIENT_SEGMENT_MM,
     JOG_INVERT_X,

@@ -68,7 +68,15 @@ be at the requested feed at its own ends, whatever the acceleration.
 
 ## Tests
 
-`tests/test_spray_gui.py` is inherited from the Shapeoko project and still
-asserts its travel limits and its 2 mm gradient segmentation. Expect
-failures until it is updated — they are the suite being out of date, not
-the machine.
+    .venv/bin/python -m pytest tests/ -q
+
+122 tests, about a tenth of a second. They cover the planner, the script
+language, the gradient maths and the transport's translation layer — all
+pure logic, no hardware and no display. `conftest.py` stubs Tkinter where
+it is missing, so the suite runs on a headless machine too.
+
+Worth running after any edit to `spray_gui.py`, `stage.py` or
+`pico_controller.py`: the things they catch — a sign flip the wrong way, a
+lead distance that stops matching the firmware's, a modal `G90` that hides
+a Z word from the stripper — are all faults that look fine from the GUI
+and go wrong on the slide.

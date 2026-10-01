@@ -12,13 +12,11 @@ from dataclasses import asdict
 
 import pytest
 
-from spray_stage.controller import ShapeokoController
+from spray_stage.pico_controller import Limits, PicoController
 from spray_stage.spray_gui import (
     DEFAULT_MAX_FEED_XY,
     DEFAULT_MAX_RATE_XY,
-    DEFAULT_MAX_X,
-    DEFAULT_MAX_Y,
-    DEFAULT_PULLOFF,
+    DEFAULT_TRAVEL_FEED,
     GRADIENT_MODES,
     KINDS,
     MAX_GRADIENT_SEGMENTS,
@@ -47,7 +45,19 @@ from spray_stage.spray_gui import (
     validate_script_items,
 )
 
-ENV = Envelope(max_x=845.0, max_y=850.0, max_z=95.0, pulloff=6.0)
+# A roomy test envelope, deliberately the same numbers the Shapeoko suite
+# used, so every coordinate the older tests chose still lies inside it and
+# only genuinely changed behaviour needed new assertions. The real stage is
+# much smaller; Envelope() carries its true limits.
+ENV = Envelope(min_x=-845.0, max_x=-6.0, min_y=-850.0, max_y=-6.0,
+               max_feed_xy=6000.0, max_rate_xy=10000.0)
+
+# Acceleration decides how much run-up a gradient pass needs, and the
+# planner puts that distance outside the coated span. Tests that care about
+# where a ramped move actually starts and ends ask for it the same way the
+# planner does rather than hard-coding a number.
+def lead_for(feed, axis="Y", env=ENV):
+    return env.lead(feed, axis)
 
 
 def gcode_only(plan):
@@ -55,9 +65,22 @@ def gcode_only(plan):
 
 
 def test_zero_is_the_home_corner():
-    # Home is back-right with Z up; the bed lies in negative X and Y.
-    assert (ENV.hi_x, ENV.hi_y, ENV.hi_z) == (-6.0, -6.0, -6.0)
-    assert (ENV.lo_x, ENV.lo_y, ENV.lo_z) == (-845.0, -850.0, -90.0)
+    # Home is back-right and the work area lies in negative X and Y - the
+    # convention inherited from the Shapeoko. The firmware counts positive
+    # millimetres from the same corner; the transport flips the sign, and
+    # nothing above it ever sees a positive coordinate.
+    assert (ENV.hi_x, ENV.hi_y) == (-6.0, -6.0)
+    assert (ENV.lo_x, ENV.lo_y) == (-845.0, -850.0)
+
+
+def test_there_is_no_z_axis():
+    # The spray standoff is fixed and set by hand. Z collapses to a single
+    # point so that the three-axis plumbing above it - the readout, the cup
+    # record, jog_target - keeps working without knowing the machine is flat.
+    assert ENV.lo_z == ENV.hi_z == 0.0
+    assert ENV.clamp_error_z("cup", -70.0) == []
+    assert ENV.clamp_error_z("cup", 0.0) == []
+    assert ENV.clamp_error_z("cup", 999.0) == []
 
 
 def test_reachable_range_stops_at_the_pulloff():
@@ -169,25 +192,38 @@ def test_validate_rejects_y_beyond_envelope():
     assert any("end Y" in e for e in errs)
 
 
-def test_feed_ceiling_defaults_to_6000_and_is_an_operator_setting():
-    assert DEFAULT_MAX_FEED_XY == 6000.0
-    assert ENV.max_feed_xy == 6000.0
-    assert SprayLine("line", "X", -400, -400, 20, 6000).validate(ENV) == []
-    assert any("feed" in e for e in SprayLine("line", "X", -400, -400, 20, 6001).validate(ENV))
+def test_feed_ceiling_is_the_measured_step_loss_cliff():
+    # Not a preference: both axes hold position to a few microns at 2400
+    # mm/min and lose about 0.157 mm at 3000. The firmware refuses anything
+    # above it rather than clamping, because clamping would flatten the fast
+    # end of a gradient and change the coating while appearing to work.
+    assert DEFAULT_MAX_FEED_XY == 2400.0
+    assert DEFAULT_MAX_RATE_XY == 2400.0
+    assert SprayLine("line", "X", -400, -400, 20, 2400).validate(Envelope(
+        min_x=-845.0, max_x=-6.0, min_y=-850.0, max_y=-6.0)) == []
+
+
+def test_travel_feed_default_sits_below_the_cliff():
+    # The ceiling is a cliff, not a cruising speed: there is nothing to gain
+    # from crossing the bed at the exact rate where step loss begins.
+    assert DEFAULT_TRAVEL_FEED == 1800.0
+    assert DEFAULT_TRAVEL_FEED < DEFAULT_MAX_FEED_XY
 
 
 def test_feed_ceiling_is_per_envelope_not_global():
-    slow = Envelope(max_feed_xy=2000.0)
-    fast = Envelope(max_feed_xy=9000.0)
+    roomy = dict(min_x=-845.0, max_x=-6.0, min_y=-850.0, max_y=-6.0)
+    slow = Envelope(max_feed_xy=2000.0, **roomy)
+    fast = Envelope(max_feed_xy=9000.0, **roomy)
     line = SprayLine("line", "X", -400, -400, 20, 5000)
     assert any("feed" in e for e in line.validate(slow))
     assert line.validate(fast) == []
 
 
-def test_firmware_rate_is_separate_from_the_operator_ceiling():
-    # $110/$111 is the hard bound the operator setting must stay under.
-    assert DEFAULT_MAX_RATE_XY == 10000.0
-    assert ENV.max_rate_xy == 10000.0
+def test_operator_ceiling_can_only_tighten_the_machine_limit():
+    # The operator setting is a guard rail below the firmware's, never above
+    # it: raising it cannot make the machine faster, only let a recipe ask
+    # for a feed the stage will refuse outright.
+    assert ENV.max_rate_xy >= ENV.max_feed_xy or ENV.max_feed_xy <= DEFAULT_MAX_FEED_XY
 
 
 def test_validate_rejects_bad_scalars():
@@ -213,12 +249,12 @@ def test_jog_target_moves_the_right_axis():
 
 def test_jog_target_is_bounds_checkable():
     # A step that would leave the machine must be catchable before it is sent.
-    assert ENV.clamp_error_xyz("jog", *jog_target((-10.0, -200.0, -50.0), "X", +1, 10.0))
-    assert ENV.clamp_error_xyz("jog", *jog_target((-840.0, -200.0, -50.0), "X", -1, 10.0))
-    assert ENV.clamp_error_xyz("jog", *jog_target((-400.0, -200.0, -10.0), "Z", +1, 10.0))
-    assert ENV.clamp_error_xyz("jog", *jog_target((-400.0, -200.0, -85.0), "Z", -1, 10.0))
-    assert not ENV.clamp_error_xyz("jog", *jog_target((-400.0, -200.0, -50.0), "X", +1, 10.0))
-    assert not ENV.clamp_error_xyz("jog", *jog_target((-400.0, -200.0, -50.0), "Z", -1, 10.0))
+    assert ENV.clamp_error_xyz("jog", *jog_target((-10.0, -200.0, 0.0), "X", +1, 10.0))
+    assert ENV.clamp_error_xyz("jog", *jog_target((-840.0, -200.0, 0.0), "X", -1, 10.0))
+    assert ENV.clamp_error_xyz("jog", *jog_target((-400.0, -10.0, 0.0), "Y", +1, 10.0))
+    assert not ENV.clamp_error_xyz("jog", *jog_target((-400.0, -200.0, 0.0), "X", +1, 10.0))
+    # A Z step is unreachable from the GUI and bounds-checks as a no-op.
+    assert not ENV.clamp_error_xyz("jog", *jog_target((-400.0, -200.0, 0.0), "Z", -1, 10.0))
 
 
 def test_jog_to_edge_reaches_the_limits():
@@ -228,8 +264,8 @@ def test_jog_to_edge_reaches_the_limits():
     assert jog_to_edge(p, "X", -1, ENV) == -445.0  # -845 - (-400)
     assert jog_to_edge(p, "Y", +1, ENV) == 194.0  # -6 - (-200)
     assert jog_to_edge(p, "Y", -1, ENV) == -650.0  # -850 - (-200)
-    assert jog_to_edge(p, "Z", +1, ENV) == 44.0  # -6 - (-50)
-    assert jog_to_edge(p, "Z", -1, ENV) == -40.0  # -90 - (-50)
+    assert jog_to_edge((-400.0, -200.0, 0.0), "Z", +1, ENV) == 0.0  # no Z travel
+    assert jog_to_edge((-400.0, -200.0, 0.0), "Z", -1, ENV) == 0.0
 
 
 def test_jog_to_edge_lands_inside_the_envelope():
@@ -252,52 +288,39 @@ def test_jog_to_edge_lands_inside_the_envelope():
 def test_jog_to_edge_is_zero_when_already_at_the_limit():
     assert jog_to_edge((-6.0, -400.0, -50.0), "X", +1, ENV) == 0.0
     assert jog_to_edge((-845.0, -400.0, -50.0), "X", -1, ENV) == 0.0
-    assert jog_to_edge((-400.0, -400.0, -6.0), "Z", +1, ENV) == 0.0
-    assert jog_to_edge((-400.0, -400.0, -90.0), "Z", -1, ENV) == 0.0
+    assert jog_to_edge((-400.0, -400.0, 0.0), "Z", +1, ENV) == 0.0
+    assert jog_to_edge((-400.0, -400.0, 0.0), "Z", -1, ENV) == 0.0
 
 
-def test_cup_z_is_bounds_checked():
-    assert ENV.clamp_error_z("cup", -55.0) == []
-    assert ENV.clamp_error_z("cup", -90.0) == []  # the usable floor
-    assert ENV.clamp_error_z("cup", -91.0)  # into the unusable bottom margin
-    assert ENV.clamp_error_z("cup", -5.0)  # inside the pull-off, unreachable
-    assert ENV.clamp_error_z("cup", 10.0)  # positive is off the machine
+def test_a_cup_height_from_the_old_machine_is_harmless():
+    # Stored settings carry a Z from the Shapeoko. With no Z axis there is
+    # nothing for it to be outside of, so it is accepted and ignored rather
+    # than rejected - the cup is an XY position now.
+    assert ENV.clamp_error_z("cup", -70.02) == []
 
 
-def test_z_floor_keeps_clear_of_the_bottom_of_travel():
-    # $132 is 95 mm, but the last 5 mm are not usable on this machine.
-    assert ENV.max_z == 95.0
-    assert ENV.lo_z == -90.0
+def test_cup_move_is_one_xy_move():
+    # The Shapeoko had to retract before traversing and descend afterwards,
+    # so that the head never crossed the bed lower than it had to. With a
+    # fixed standoff there is no height to get wrong, and the whole
+    # ordering problem goes with it.
+    moves = plan_cup_move(0.0, (-745.0, -650.0, 0.0), 4000)
+    assert moves == ["G90 G1 X-745.000 Y-650.000 F4000"]
 
 
-def test_cup_move_retracts_before_traversing_when_going_up():
-    # Cup is higher than the head (less negative Z): lift first, then traverse.
-    moves = plan_cup_move(-70.0, (-745.0, -650.0, -30.0), 4000)
-    assert moves[0].startswith("G90 G1 Z")
-    assert moves[1].startswith("G90 G1 X")
-
-
-def test_cup_move_traverses_before_descending_when_going_down():
-    # Cup is lower: cross at the current height, then come down.
-    moves = plan_cup_move(-30.0, (-745.0, -650.0, -70.0), 4000)
-    assert moves[0].startswith("G90 G1 X")
-    assert moves[1].startswith("G90 G1 Z")
-
-
-def test_cup_move_never_traverses_below_either_endpoint():
-    # Whichever order is chosen, the XY traverse must happen at the higher
-    # (less negative) of the two heights.
-    for cur_z, cup_z in [(-70.0, -30.0), (-30.0, -70.0), (-40.0, -40.0), (-90.0, -6.0)]:
-        moves = plan_cup_move(cur_z, (-745.0, -650.0, cup_z), 4000)
-        z_first = moves[0].startswith("G90 G1 Z")
-        traverse_z = cup_z if z_first else cur_z
-        assert traverse_z == max(cur_z, cup_z)
+def test_cup_move_ignores_any_stored_height():
+    # Whatever Z a settings file carries - including one saved against the
+    # old machine - the move is the same single traverse.
+    for cup_z in (0.0, -30.0, -70.02, -90.0):
+        assert plan_cup_move(-70.0, (-745.0, -650.0, cup_z), 4000) == [
+            "G90 G1 X-745.000 Y-650.000 F4000"
+        ]
 
 
 def test_cup_move_sends_coordinates_untranslated():
-    moves = plan_cup_move(-90.0, (-745.0, -650.0, -55.0), 4000)
+    moves = plan_cup_move(0.0, (-745.0, -650.0, 0.0), 4000)
     assert any("X-745.000 Y-650.000" in m for m in moves)
-    assert any("Z-55.000" in m for m in moves)
+    assert not any("Z" in m for m in moves)
 
 
 def test_pad_hit_maps_each_quadrant():
@@ -336,45 +359,71 @@ def test_pad_hit_diagonals_are_stable_at_the_boundaries():
         assert hit[0] in ("X", "Y") and hit[1] in (1, -1)
 
 
-def test_read_envelope_parses_board_settings(fake_serial):
-    ctrl = ShapeokoController("/dev/fake")
+REPLY = [
+    b"[LIM:X3.00..94.00,Y3.00..139.00]\n",
+    b"[FEED:MAX2400,TRAVEL1800,MIN30]\n",
+    b"[ACC:X800,Y800,V2.00]\n",
+    b"ok\n",
+]
+
+
+def connected(fake_serial):
+    """A controller on a fake port, past the status-and-limits handshake."""
+    ctrl = PicoController("/dev/fake")
     ctrl.connect()
-    ctrl._serial._queue.extend(
-        [b"$27=6.000\n", b"$130=845.000\n", b"$131=850.000\n", b"ok\n"],
-    )
+    return ctrl
+
+
+def words(move):
+    """The G-code words of one move, as {letter: value}."""
+    return {w[0]: w[1:] for w in move.split()[1:]}
+
+
+def test_read_envelope_flips_the_sign_of_the_boards_limits(fake_serial):
+    # The firmware counts positive millimetres from home; everything above
+    # the transport works in the negative frame. The near limit on the board
+    # is therefore the FAR limit here, which is the part a naive negation
+    # would get backwards.
+    ctrl = connected(fake_serial)
+    ctrl._serial._queue.extend(REPLY)
     env = read_envelope(ctrl)
-    assert (env.pulloff, env.max_x, env.max_y) == (6.0, 845.0, 850.0)
+    assert (env.lo_x, env.hi_x) == (-94.0, -3.0)
+    assert (env.lo_y, env.hi_y) == (-139.0, -3.0)
 
 
-def test_read_envelope_takes_the_slower_of_the_two_axis_rates(fake_serial):
-    ctrl = ShapeokoController("/dev/fake")
-    ctrl.connect()
-    ctrl._serial._queue.extend([b"$110=10000.000\n", b"$111=8000.000\n", b"ok\n"])
-    assert read_envelope(ctrl).max_rate_xy == 8000.0
+def test_read_envelope_takes_the_acceleration_too(fake_serial):
+    # The lead distances a gradient needs must match what the firmware will
+    # actually do. Two copies of that constant would drift apart and the
+    # coating would quietly stop matching the recipe.
+    ctrl = connected(fake_serial)
+    ctrl._serial._queue.extend(REPLY)
+    env = read_envelope(ctrl)
+    assert env.accel("X") == 800.0
+    assert env.accel("Y") == 800.0
+    assert env.junction == 2.0
 
 
-def test_read_envelope_preserves_the_operator_ceiling(fake_serial):
-    # The board has no opinion about the operator setting; re-reading it on
-    # connect must not silently reset the user's choice.
-    ctrl = ShapeokoController("/dev/fake")
-    ctrl.connect()
-    ctrl._serial._queue.extend([b"$130=845.000\n", b"ok\n"])
-    assert read_envelope(ctrl, max_feed_xy=3500.0).max_feed_xy == 3500.0
+def test_read_envelope_clamps_the_operator_ceiling_to_the_machines(fake_serial):
+    # The operator setting is a guard rail below the machine's limit. A
+    # value saved against the Shapeoko's 6000 must not survive as licence to
+    # ask this stage for a feed it will refuse.
+    ctrl = connected(fake_serial)
+    ctrl._serial._queue.extend(REPLY)
+    assert read_envelope(ctrl, max_feed_xy=6000.0).max_feed_xy == 2400.0
+    ctrl._serial._queue.extend(REPLY)
+    assert read_envelope(ctrl, max_feed_xy=1500.0).max_feed_xy == 1500.0
 
 
 def test_read_envelope_falls_back_when_board_is_silent(fake_serial):
-    ctrl = ShapeokoController("/dev/fake")
-    ctrl.connect()
+    ctrl = connected(fake_serial)
 
     def boom(*_args, **_kwargs):
         raise TimeoutError("no response")
 
-    ctrl.send = boom
+    ctrl.read_limits = boom
     env = read_envelope(ctrl)
-    assert (env.pulloff, env.max_x, env.max_y) == (
-        DEFAULT_PULLOFF,
-        DEFAULT_MAX_X,
-        DEFAULT_MAX_Y,
+    assert (env.lo_x, env.hi_x, env.lo_y, env.hi_y) == (
+        Envelope().lo_x, Envelope().hi_x, Envelope().lo_y, Envelope().hi_y,
     )
 
 
@@ -484,23 +533,63 @@ def test_gradient_return_mirrors_the_outward_speeds():
     assert [f for _, f in out] == [f for _, f in reversed(back)]
 
 
-def test_gradient_pass_emits_both_strokes_at_ramped_feeds():
+def test_gradient_pass_is_one_move_per_stroke():
+    # GRBL held one feed per move, so a ramp had to be chopped into short
+    # constant-feed segments. The stage sweeps its step rate continuously,
+    # so each stroke is a single command carrying both feeds.
     ln = SprayLine("line_back", "X", -400, -400, 20, 500, 1, 0.0, feed_end=2000)
-    moves = [m for m in gcode_only(plan_moves([ln], 2000)) if "F" in m][1:]
-    n = gradient_count(20)
-    assert len(moves) == 2 * n
-    assert moves[0].endswith("F575")  # first outward segment
-    assert moves[-1].endswith("F575")  # last return segment, same place
+    ramped = [m for m in gcode_only(plan_moves([ln], 2000, ENV)) if "E" in m]
+    assert len(ramped) == 2
+    assert "F500" in ramped[0] and "E2000" in ramped[0]
+    assert "F2000" in ramped[1] and "E500" in ramped[1]
 
 
-def test_gradient_segment_count_scales_with_length_and_is_capped():
+def test_gradient_return_stroke_reverses_the_feeds():
+    # Every point on the line is then traversed at the same speed in both
+    # directions, so the gradient shapes the coating instead of smearing it.
+    ln = SprayLine("line_back", "Y", -400, -400, 20, 500, 1, 0.0, feed_end=2000)
+    ramped = [m for m in gcode_only(plan_moves([ln], 2000, ENV)) if "E" in m]
+    out, back = words(ramped[0]), words(ramped[1])
+    assert float(out["F"]) == float(back["E"])
+    assert float(out["E"]) == float(back["F"])
+    assert out["I"] == back["I"] and out["K"] == back["K"]
+
+
+def test_gradient_runs_in_before_the_span_and_out_past_it():
+    # A pass that starts and stops on the coated span cannot be at the
+    # requested feed at its own ends, whatever the acceleration. So the
+    # ramps are put outside, and the gradient is defined only over what
+    # lies between the two lead distances.
+    ln = SprayLine("line_back", "Y", -400, -400, 20, 500, 1, 0.0, feed_end=2000)
+    lead = lead_for(2000)
+    assert lead > 0
+    ramped = [m for m in gcode_only(plan_moves([ln], 2000, ENV)) if "E" in m]
+    assert f"I{lead:.2f}" in ramped[0] and f"K{lead:.2f}" in ramped[0]
+    # Outward stroke overshoots the far end by exactly the lead-out.
+    assert f"Y{-380.0 + lead:.3f}" in ramped[0]
+    # Return stroke comes back to the lead-in point, short of the start.
+    assert f"Y{-400.0 - lead:.3f}" in ramped[1]
+
+
+def test_gradient_mode_rides_along_as_a_q_word():
+    for mode, q in (("velocity", "Q0"), ("thickness", "Q1")):
+        ln = SprayLine("line_back", "Y", -400, -400, 20, 500, 1, 0.0,
+                       feed_end=2000, gradient_mode=mode)
+        ramped = [m for m in gcode_only(plan_moves([ln], 2000, ENV)) if "E" in m]
+        assert all(q in m for m in ramped)
+
+
+def test_gradient_segment_helpers_survive_for_previewing():
+    # No longer used to emit G-code, but still the clearest way to sample a
+    # profile when checking one by eye.
     assert gradient_count(20) == 10
     assert gradient_count(1) == 2  # never fewer than two
     assert gradient_count(10_000) == MAX_GRADIENT_SEGMENTS
 
 
 def test_end_feed_is_range_checked():
-    env = Envelope(max_feed_xy=4000.0)
+    env = Envelope(min_x=-845.0, max_x=-6.0, min_y=-850.0, max_y=-6.0,
+                   max_feed_xy=4000.0)
     assert SprayLine("line_back", "X", -400, -400, 20, 500, feed_end=4000).validate(env) == []
     errs = SprayLine("line_back", "X", -400, -400, 20, 500, feed_end=4001).validate(env)
     assert any("end feed" in e for e in errs)
@@ -817,22 +906,13 @@ def test_duration_formats_readably():
     assert format_duration(3599) == "59m59s"
 
 
-def test_cup_move_skips_a_zero_length_z_leg():
-    # Spraying happens at the cup's height, so the Z leg is normally a no-op.
-    # Sending it stalls the run: GRBL finishes it before a status poll can see
-    # the machine move, so the wait falls through to its grace period.
-    moves = plan_cup_move(-70.02, (-130.0, -180.0, -70.02), 2000)
-    assert moves == ["G90 G1 X-130.000 Y-180.000 F2000"]
-
-
-def test_cup_move_still_emits_z_when_it_actually_moves():
-    assert len(plan_cup_move(-70.0, (-130.0, -180.0, -30.0), 2000)) == 2
-    assert len(plan_cup_move(-30.0, (-130.0, -180.0, -70.0), 2000)) == 2
-
-
-def test_cup_move_z_threshold_is_tight_enough_to_matter():
-    # A real standoff change of a tenth of a millimetre must survive.
-    assert len(plan_cup_move(-70.0, (-130.0, -180.0, -70.1), 2000)) == 2
+def test_cup_move_is_always_a_single_move():
+    # One move, so there is no second leg for the run to wait on. This used
+    # to matter a great deal: a zero-length Z leg finished before a status
+    # poll could catch the machine moving, and every pattern ended with a
+    # visible stall while the wait fell through its grace period.
+    for cur_z in (-70.02, -70.0, -30.0):
+        assert len(plan_cup_move(cur_z, (-130.0, -180.0, -70.02), 2000)) == 1
 
 
 # --- script insert menu ---------------------------------------------------
@@ -862,3 +942,127 @@ def test_snippet_selection_targets_the_editable_part():
 def test_all_snippets_together_form_a_valid_script():
     joined = "\n".join(snip for _, snip in SCRIPT_SNIPPETS)
     assert parse_script(joined)[1] == []
+
+
+# --- the transport ---------------------------------------------------------
+#
+# PicoController speaks GRBL upward and the stage's dialect downward. Two
+# bugs lived here and both were invisible from the GUI: a modal G90 prefix
+# that stopped a move reaching the Z-stripper, and a connect that waited for
+# a banner the board had already printed. The translation is pure, so it can
+# be tested without a port at all.
+
+
+def shim(pos=(-50.0, -50.0)):
+    ctrl = PicoController.__new__(PicoController)
+    ctrl._last_feed = 0.0
+    ctrl._pos = pos
+    ctrl.limits = Limits()
+    return ctrl
+
+
+def test_limits_are_negative_with_the_far_end_first():
+    lim = Limits()
+    assert lim.min_x < lim.max_x < 0
+    assert lim.min_y < lim.max_y < 0
+
+
+def test_coordinates_are_negated_on_the_way_to_the_board():
+    assert shim()._translate("G1 X-20.000 Y-30.000 F1800") == "G1 X20.000 Y30.000 F1800"
+
+
+def test_status_is_negated_on_the_way_back():
+    ctrl = shim()
+    st = ctrl._note_status("<Idle|MPos:86.580,9.930>")
+    assert st.mpos == (-86.58, -9.93, 0.0)
+    assert ctrl._pos == (-86.58, -9.93)
+
+
+def test_an_unhomed_board_reports_no_position():
+    st = shim()._note_status("<Alarm|MPos:none>")
+    assert st.state == "Alarm"
+    assert st.mpos is None
+
+
+def test_a_modal_g90_still_reaches_the_move_translator():
+    # The bug: dispatching on a startswith("G1") test missed this line
+    # entirely, so Z and a zero feed went straight to the firmware.
+    assert shim()._translate("G90 G1 Z-70.050 F0") is None
+    assert shim()._translate("G90 G1 X-20.000 Y-30.000 F1800") == "G1 X20.000 Y30.000 F1800"
+
+
+def test_z_is_dropped_but_xy_survives_beside_it():
+    assert shim()._translate("G1 X-20.000 Y-30.000 Z-70.000 F900") == "G1 X20.000 Y30.000 F900"
+
+
+def test_the_preamble_is_swallowed():
+    for noop in ("G21", "G90", "M5", "G21 G90"):
+        assert shim()._translate(noop) is None
+
+
+def test_gradient_words_ride_through_untouched():
+    out = shim()._translate("G1 Y-61.751 F600 E2400 I1.50 K1.50 Q1")
+    assert out == "G1 Y61.751 F600 E2400 I1.50 K1.50 Q1"
+
+
+def test_a_relative_jog_becomes_an_absolute_move():
+    # The firmware has no jog and no relative mode, so the transport has to
+    # know where the machine is to turn one into the other.
+    assert shim()._translate("$J=G91 G21 X10.000 F600") == "G1 X40.000 Y50.000 F600"
+    assert shim()._translate("$J=G91 G21 X-10.000 F600") == "G1 X60.000 Y50.000 F600"
+
+
+def test_a_jog_before_homing_is_refused_rather_than_guessed():
+    ctrl = shim(pos=None)
+    with pytest.raises(Exception):
+        ctrl._translate("$J=G91 G21 X10.000 F600")
+
+
+def test_system_commands_pass_straight_through():
+    for cmd in ("$H", "$$", "?", "!"):
+        assert shim()._translate(cmd) == cmd
+
+
+def test_lead_grows_with_the_square_of_the_feed():
+    # v^2 - v0^2 = 2*a*d, so doubling the feed roughly quadruples the
+    # run-up. This is why the fast end of a gradient is the expensive one.
+    # Only roughly: the junction speed the move starts from is subtracted,
+    # and at low feeds that term is a real fraction of the answer.
+    lim = Limits()
+    near, far = lim.lead(1200, "Y") - 0.5, lim.lead(2400, "Y") - 0.5
+    assert far == pytest.approx(4 * near, rel=0.02)
+    # At a low feed the junction speed shows. Subtracting v0^2 takes a
+    # larger fraction of a small number, so halving the feed gives slightly
+    # LESS than a quarter of the run-up, not slightly more.
+    assert lim.lead(600, "Y") - 0.5 < (lim.lead(1200, "Y") - 0.5) / 4
+
+
+def test_lead_matches_what_the_envelope_computes():
+    # One source of truth: the host must not ask for a lead the firmware
+    # will not honour.
+    assert Limits().lead(2400, "X") == pytest.approx(Envelope().lead(2400, "X"))
+
+
+# --- time estimates for ramped moves --------------------------------------
+
+
+def test_a_ramped_move_is_not_distance_over_mean_feed():
+    # Time is the integral of 1/v, and the slow end dominates it. Using the
+    # mean feed underestimates an 18 mm 600->2400 pass by about a third.
+    ln = SprayLine("line_back", "Y", -400, -400, 20, 600, 1, 0.0,
+                   feed_end=2400, gradient_mode="thickness")
+    ramped = estimate_seconds(plan_moves([ln], 1800, ENV), start=(-400.0, -400.0))
+    flat = SprayLine("line_back", "Y", -400, -400, 20, 1500, 1, 0.0)
+    naive = estimate_seconds(plan_moves([flat], 1800, ENV), start=(-400.0, -400.0))
+    assert ramped > naive
+
+
+def test_thickness_mode_takes_longer_than_velocity_mode():
+    # Thickness mode holds the slow end longer, because it is 1/v that is
+    # interpolated linearly rather than v.
+    def secs(mode):
+        ln = SprayLine("line_back", "Y", -400, -400, 20, 600, 1, 0.0,
+                       feed_end=2400, gradient_mode=mode)
+        return estimate_seconds(plan_moves([ln], 1800, ENV), start=(-400.0, -400.0))
+
+    assert secs("thickness") > secs("velocity")
