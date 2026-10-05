@@ -785,7 +785,7 @@ def read_envelope(ctrl: ShapeokoController, max_feed_xy: float = DEFAULT_MAX_FEE
     """
     try:
         lim = ctrl.read_limits()
-    except (GrblError, TimeoutError, RuntimeError, AttributeError):
+    except (GrblError, OSError, RuntimeError, AttributeError):
         return Envelope(max_feed_xy=max_feed_xy)
     return Envelope(
         min_x=lim.min_x, max_x=lim.max_x,
@@ -1581,7 +1581,7 @@ class SprayApp(tk.Tk):
                 self._emit("state", "moving to cup…")
                 if self._send_moves(ctrl, moves):
                     self._emit("log", "at cup position.")
-            except (GrblError, TimeoutError, RuntimeError) as e:
+            except (GrblError, OSError, RuntimeError) as e:
                 self._emit("log", f"! {e}")
             finally:
                 self._io_lock.release()
@@ -1829,7 +1829,7 @@ class SprayApp(tk.Tk):
             else:
                 ctrl.send(f"$J=G91 G21 {axis}{distance:.3f} F{feed:g}",
                           response_timeout=120.0)
-        except (GrblError, TimeoutError, RuntimeError) as e:
+        except (GrblError, OSError, RuntimeError) as e:
             self._emit("log", f"! jog failed: {e}")
         finally:
             self._io_lock.release()
@@ -2014,7 +2014,7 @@ class SprayApp(tk.Tk):
                     got = st.state if st else "?"
                     self._emit("log", f"! homing did not settle (state={got}); see docs")
                     self._emit("homed", False)
-            except (GrblError, TimeoutError, RuntimeError) as e:
+            except (GrblError, OSError, RuntimeError) as e:
                 self._emit("log", f"! homing failed: {e}")
                 self._emit("homed", False)
             finally:
@@ -2658,9 +2658,20 @@ class SprayApp(tk.Tk):
                     spray_s = time.monotonic() - (self._run_t0 or time.monotonic())
                     self._emit("log", f"run complete in {spray_s:.1f} s.")
                     self._park_at_cup(ctrl, cup, start_z, tf)
-            except (GrblError, TimeoutError, RuntimeError) as e:
+            # OSError is the one that matters here: pyserial raises
+            # SerialException, which subclasses OSError and NOT RuntimeError,
+            # when the port goes away mid-write. Without it the worker died
+            # with an unhandled exception on its own thread - the traceback
+            # went to stderr where nobody sees it, the log showed the last
+            # note and then jumped straight to "total elapsed" from the
+            # finally, and none of the recovery below ran. A USB drop looked
+            # like the program quietly giving up. (The builtin TimeoutError is
+            # an OSError too, so it is still covered.)
+            except (GrblError, OSError, RuntimeError) as e:
                 self._emit("log", f"! {e}")
-                if isinstance(e, TimeoutError):
+                if isinstance(e, OSError):
+                    # Covers both a board that stopped answering and a port
+                    # that was yanked out from under us.
                     self._recover_link(ctrl)
             finally:
                 self._io_lock.release()

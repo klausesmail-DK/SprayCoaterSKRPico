@@ -1181,3 +1181,28 @@ def test_when_nothing_matches_every_port_is_offered(monkeypatch):
     # A generic CDC driver can leave a Windows port with no identifying marks.
     # An empty chooser is a dead end; a wrong guess is only a wrong guess.
     assert _ports(monkeypatch, _FakePort("COM1"), _FakePort("COM2")) == ["COM1", "COM2"]
+
+
+# --- what the run worker must catch ---------------------------------------
+
+
+def test_a_lost_port_raises_something_oserror_shaped():
+    """The assumption the run worker's except clause rests on.
+
+    pyserial raises SerialException when the port disappears mid-write, and it
+    subclasses OSError rather than RuntimeError. Catching only
+    (GrblError, TimeoutError, RuntimeError) let it through: the worker died on
+    its own thread, the traceback went to stderr where no operator looks, and
+    the log jumped from the last note straight to "total elapsed" with no
+    error at all - a USB drop presenting as the program quietly giving up.
+
+    If a future pyserial changes that hierarchy, this fails here rather than
+    silently at the bench with the pump running.
+    """
+    import serial
+
+    assert issubclass(serial.SerialException, OSError)
+    assert not issubclass(serial.SerialException, RuntimeError)
+    # And the builtin, which _transact raises, is an OSError too - so one
+    # clause covers both.
+    assert issubclass(TimeoutError, OSError)
