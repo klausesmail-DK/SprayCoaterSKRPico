@@ -50,6 +50,7 @@ MEASURED LIMITS (24 V, 1/16 ustep, 0.40 A, Tr6x4, 800 steps/mm)
 
 import machine
 import rp2
+import select
 import sys
 import time
 from machine import UART, Pin, mem32
@@ -275,8 +276,25 @@ def _panic():
     if not WATCH_STDIN or _poll is None:
         return 0
     try:
-        if _poll.poll(0):
-            return 2 if sys.stdin.read(1) in ("!", "\x18") else 1
+        for _obj, ev in _poll.poll(0):
+            if ev & select.POLLIN:
+                return 2 if sys.stdin.read(1) in ("!", "\x18") else 1
+            # POLLHUP or POLLERR: the host closed the port, or the link died.
+            #
+            # This used to test the poll result for truthiness alone and then
+            # call a BLOCKING read(1). A hung-up port polls ready forever and
+            # never delivers a byte, so the read never returned: the move
+            # stopped here with the drivers live, printing nothing, reading
+            # nothing, and the time bound in _sweep could not help because
+            # control never got back to the loop. Only the power switch did.
+            # Every GUI exit and every disconnect leaves exactly that state
+            # behind, which is why it took a few runs to find.
+            #
+            # Nothing useful can be read from a dead link, so treat it as a
+            # stop request: decelerate, keep the step count, keep the home
+            # reference, and let serve() find out for itself when its own
+            # readline returns.
+            return 1
     except Exception:
         pass
     return 0
@@ -680,7 +698,8 @@ def _sweep(plan, length, f0, f1, mode, lead_in, lead_out, accel, watch=None):
 
     Returns 0 when the move completed, 1 when the host asked it to stop
     early (decelerated, position recoverable from the step counters), 2 when
-    it was aborted or hit an endstop (position lost).
+    it was aborted or hit an endstop (position lost), and 3 when it overran
+    the time its own profile needs - see the deadline below.
 
     A stop request does not slam the drivers off: at 30 mm/s that would lose
     steps and the position would be a guess again. It ramps down at the
@@ -697,6 +716,23 @@ def _sweep(plan, length, f0, f1, mode, lead_in, lead_out, accel, watch=None):
     for a, _ in plan:
         ids += a.sm_ids
         motors += a.motors
+    # A move that cannot finish must not be able to hang the board. Every
+    # other exit from this loop depends on the machine: a motor reporting its
+    # step count, or the host asking to stop. A motor that never reports -
+    # a lost FIFO word, a state machine left mid-program - would spin here
+    # forever with the drivers live, while the host sits in a blocking read
+    # waiting for the ok that is never printed. Nothing times out on either
+    # side and the only way back is the power switch.
+    #
+    # So: three times the time the commanded profile needs at its slowest
+    # sustained speed, plus two seconds. The ramps are a few tens of
+    # milliseconds at these accelerations, so that factor applies to
+    # essentially the whole move and cannot be reached by one that is merely
+    # slow. A travel move across the bed is bounded at about fifteen
+    # seconds; the slowest legal gradient over full Y travel, minutes.
+    v_min = min(f0, f1) / 60.0
+    deadline = time.ticks_add(time.ticks_ms(),
+                              int(3000.0 * length / v_min) + 2000)
     _sm_enable(ids, True)
     t_prev = time.ticks_us()
     while True:
@@ -718,6 +754,13 @@ def _sweep(plan, length, f0, f1, mode, lead_in, lead_out, accel, watch=None):
                 break
         if finished:
             return 0
+        if time.ticks_diff(deadline, time.ticks_ms()) < 0:
+            # No graceful ramp-down: that would read the same step counters
+            # whose silence brought us here. Stop hard, lose the position,
+            # make the host re-home.
+            print("  %s: move overran its time bound - position lost"
+                  % ",".join(a.name for a, _ in plan))
+            return 3
         now = time.ticks_us()
         dt = time.ticks_diff(now, t_prev) / 1000000.0
         t_prev = now
@@ -836,7 +879,7 @@ def move(x=None, y=None, feed=None, feed_end=None, mode="velocity",
     else:
         for n, a, v, d in legs:
             a.pos = None             # aborted mid-move: position unknown
-        raise RuntimeError("aborted")
+        raise RuntimeError("timed out" if status == 3 else "aborted")
 
 
 def goto(axis, mm, feed=None):
@@ -1280,7 +1323,6 @@ def serve():
     hand in Thonny, because it consumes everything typed at the prompt.
     """
     global WATCH_STDIN, _poll
-    import select
     _poll = select.poll()
     _poll.register(sys.stdin, select.POLLIN)
     print(BANNER)

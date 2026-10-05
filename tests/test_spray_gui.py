@@ -28,6 +28,7 @@ from spray_stage.spray_gui import (
     _next_needs_stillness,
     estimate_seconds,
     expand_script,
+    move_timeouts,
     format_duration,
     gradient_count,
     gradient_feed,
@@ -1066,3 +1067,117 @@ def test_thickness_mode_takes_longer_than_velocity_mode():
         return estimate_seconds(plan_moves([ln], 1800, ENV), start=(-400.0, -400.0))
 
     assert secs("thickness") > secs("velocity")
+
+
+# --- per-move ack timeouts -------------------------------------------------
+#
+# The firmware acks a move when it has FINISHED, so these are what stands
+# between a board that stops answering and a run that cannot be stopped.
+
+
+def _firmware_bound(length: float, f0: float, f1: float) -> float:
+    """What skr_pico_stage._sweep allows a move before calling it stuck."""
+    return 3.0 * length / (min(f0, f1) / 60.0) + 2.0
+
+
+def test_a_move_timeout_is_longer_than_the_firmwares_own_bound():
+    # Ordering that matters: the board must get to report "timed out" for
+    # itself. If the host gave up first, every stuck move would look like a
+    # dead serial link and the real reason would never reach the log.
+    for length, feed in ((76.7, 2400), (50.0, 1000), (20.0, 500), (136.0, 300)):
+        plan = [("gcode", f"G1 Y{-length:.3f} F{feed:g}")]
+        host = move_timeouts(plan, start=(0.0, 0.0))[0]
+        assert host > _firmware_bound(length, feed, feed), (length, feed)
+
+
+def test_a_move_timeout_still_leaves_room_for_the_move_itself():
+    # Four times nominal, so no legitimate move can trip it - but bounded,
+    # which is the whole point: the flat 600 s it replaced meant a silent
+    # board held the run busy for ten minutes.
+    plan = [("gcode", "G1 Y-76.714 F2400")]
+    (wait,) = move_timeouts(plan, start=(0.0, 0.0))
+    nominal = 76.714 / (2400 / 60.0)
+    assert wait > 4 * nominal
+    assert wait < 600.0
+
+
+def test_a_gradient_gets_a_longer_timeout_than_its_mean_feed_implies():
+    # _move_seconds integrates 1/v, so a ramped pass is allowed the time it
+    # actually takes rather than the time its average suggests. Long spans,
+    # because every pass in a real recipe is short enough to sit on the floor
+    # and the floor would hide the difference.
+    ramped = move_timeouts([("gcode", "G1 Y-120 F500 E1800 I1.06 K1.06 Q1")],
+                           start=(0.0, 0.0))[0]
+    flat = move_timeouts([("gcode", "G1 Y-120 F1150")], start=(0.0, 0.0))[0]
+    assert ramped > flat > 15.0
+
+
+def test_setup_lines_and_unmeasurable_moves_fall_back_to_the_floor():
+    plan = [("gcode", "G21"), ("gcode", "G90"), ("gcode", "M5"),
+            ("note", "1: Line X 50 mm"), ("pause", "0")]
+    assert move_timeouts(plan, start=(0.0, 0.0)) == [15.0] * len(plan)
+    # No starting position: the opening move cannot be measured, so it takes
+    # the floor rather than a guessed distance - and the NEXT one, which can
+    # be measured from it, does not.
+    waits = move_timeouts([("gcode", "G1 X-50.000 Y-50.000 F2400"),
+                           ("gcode", "G1 Y-120.000 F600")], start=None)
+    assert waits[0] == 15.0
+    assert waits[1] > 15.0
+
+
+# --- port discovery across platforms --------------------------------------
+#
+# Name matching alone found nothing on Windows, where every port is COMn, so
+# the chooser came up empty and there was nothing to connect to.
+
+
+class _FakePort:
+    def __init__(self, device, description="", manufacturer=None, vid=None):
+        self.device = device
+        self.description = description
+        self.manufacturer = manufacturer
+        self.vid = vid
+
+
+def _ports(monkeypatch, *fakes):
+    from spray_stage import pico_controller as pc
+
+    monkeypatch.setattr(pc.list_ports, "comports", lambda: list(fakes))
+    return [p.device for p in pc.find_ports()]
+
+
+def test_a_windows_com_port_is_found_by_vendor_id(monkeypatch):
+    from spray_stage.pico_controller import RP2040_VID
+
+    found = _ports(
+        monkeypatch,
+        _FakePort("COM3", "Standard Serial over Bluetooth link"),
+        _FakePort("COM5", "USB Serial Device", vid=RP2040_VID),
+    )
+    assert found[0] == "COM5"
+
+
+def test_the_mac_device_name_still_wins_over_an_unmarked_port(monkeypatch):
+    found = _ports(
+        monkeypatch,
+        _FakePort("/dev/cu.Bluetooth-Incoming-Port", ""),
+        _FakePort("/dev/cu.usbmodem101", "Board in FS mode"),
+    )
+    assert found[0] == "/dev/cu.usbmodem101"
+
+
+def test_a_vendor_id_match_outranks_a_mere_name_match(monkeypatch):
+    from spray_stage.pico_controller import RP2040_VID
+
+    found = _ports(
+        monkeypatch,
+        _FakePort("/dev/cu.usbserial-1420", "FT232R"),
+        _FakePort("/dev/cu.usbmodem101", "Board in FS mode", vid=RP2040_VID),
+    )
+    assert found == ["/dev/cu.usbmodem101", "/dev/cu.usbserial-1420"]
+
+
+def test_when_nothing_matches_every_port_is_offered(monkeypatch):
+    # A generic CDC driver can leave a Windows port with no identifying marks.
+    # An empty chooser is a dead end; a wrong guess is only a wrong guess.
+    assert _ports(monkeypatch, _FakePort("COM1"), _FakePort("COM2")) == ["COM1", "COM2"]

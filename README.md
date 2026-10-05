@@ -11,9 +11,30 @@ machine under them is new.
 
     ./run.sh            # creates .venv on first run, then launches the GUI
     ./push.sh           # copies the firmware to the Pico and resets it
+    ./check.sh          # what is on the board; does the firmware import
+    ./reset.sh          # restart it so serve() owns the serial line
 
 The first `./run.sh` builds the virtualenv and installs pyserial and
 mpremote, so it takes a minute. After that it is immediate.
+
+`mpremote` sends Ctrl-C when it attaches, which stops `serve()`, and nothing
+starts it again by itself. So after any board command other than a reset -
+`check.sh` included - run `./reset.sh`. The symptom otherwise is a GUI that
+opens the port and then gets no reply, which reads as a dead board.
+
+On **Windows**, `run.bat` does what `run.sh` does, and the board commands are
+the same code rather than a parallel set of scripts:
+
+    run.bat
+    .venv\Scripts\python -m spray_stage.board push
+    .venv\Scripts\python -m spray_stage.board check
+    .venv\Scripts\python -m spray_stage.board reset
+
+Nothing else differs. Python 3.11+ from python.org (the installer brings the
+Tkinter the GUI needs), the board appears as `COMn` instead of
+`/dev/cu.usbmodem101`, and the port chooser finds it by USB vendor ID, which
+is the one marking every platform agrees on. Add a port to any board command
+to skip the search: `... board push COM5`.
 
 ## Layout
 
@@ -24,6 +45,7 @@ mpremote, so it takes a minute. After that it is immediate.
 | `spray_stage/stage.py` | travel, feeds, acceleration — the machine model |
 | `spray_stage/check_recipe.py` | dry-run a recipe and print the G-code, no hardware |
 | `spray_stage/migrate_recipes.py` | move Shapeoko recipes onto this bed |
+| `spray_stage/board.py` | push / check / reset the firmware, any platform |
 | `pico_stage/` | what runs on the board — see its own README |
 | `patterns/` | recipes, already migrated |
 
@@ -70,7 +92,7 @@ be at the requested feed at its own ends, whatever the acceleration.
 
     .venv/bin/python -m pytest tests/ -q
 
-122 tests, about a tenth of a second. They cover the planner, the script
+130 tests, about a tenth of a second. They cover the planner, the script
 language, the gradient maths and the transport's translation layer — all
 pure logic, no hardware and no display. `conftest.py` stubs Tkinter where
 it is missing, so the suite runs on a headless machine too.

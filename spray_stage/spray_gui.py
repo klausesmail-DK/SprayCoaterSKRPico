@@ -709,6 +709,57 @@ def _move_seconds(dist: float, feed: float, words: dict[str, str]) -> float:
     return t
 
 
+def move_timeouts(
+    plan: list[tuple[str, str]],
+    start: tuple[float, float] | None = None,
+    factor: float = 4.0,
+    floor: float = 15.0,
+) -> list[float]:
+    """How long to wait for each entry's ack, parallel to `plan`.
+
+    This firmware acks when the move has FINISHED, so the wait has to cover
+    the move itself - which is why it used to be a flat ten minutes, long
+    enough for the slowest pass anyone might write. The cost of that flat
+    number only shows when the board stops answering: the worker sits in its
+    read for the full ten minutes, the run stays "busy" the whole time, and
+    STOP cannot end it because the thread it would end is blocked. The only
+    way out is killing the program.
+
+    Sizing the wait per move turns the same fault into one logged line a few
+    seconds after the move should have been over, with the program still
+    usable. `factor` is four because the estimate ignores acceleration and
+    because the firmware's own bound on a stuck move is three times nominal:
+    this has to sit outside that, so the board gets to say "timed out" for
+    itself rather than being cut off mid-explanation.
+    """
+    pos = start
+    feed = 0.0
+    out: list[float] = []
+    for kind, payload in plan:
+        if kind != "gcode" or "G1" not in payload:
+            out.append(floor)
+            continue
+        words = dict(_GWORD.findall(payload))
+        if "F" in words:
+            feed = float(words["F"])
+        nx, ny = words.get("X"), words.get("Y")
+        if pos is None or not feed:
+            # No reference to measure from - the opening move of a plan built
+            # before the head reported in. Fall back to the floor rather than
+            # guessing at a distance.
+            out.append(floor)
+            if nx is not None and ny is not None:
+                pos = (float(nx), float(ny))
+            continue
+        tx = float(nx) if nx is not None else pos[0]
+        ty = float(ny) if ny is not None else pos[1]
+        out.append(max(floor,
+                       factor * _move_seconds(math.hypot(tx - pos[0], ty - pos[1]),
+                                              feed, words) + 5.0))
+        pos = (tx, ty)
+    return out
+
+
 def format_duration(seconds: float) -> str:
     if seconds < 60:
         return f"{seconds:.0f}s"
@@ -1483,11 +1534,13 @@ class SprayApp(tk.Tk):
 
         Returns False if aborted or a move stalled. Caller owns the I/O lock.
         """
-        for line in moves:
+        waits = move_timeouts([("gcode", line) for line in moves],
+                              self.pos[:2] if self.pos else None)
+        for i, line in enumerate(moves):
             if self._abort.is_set():
                 self._emit("log", "aborted.")
                 return False
-            ctrl.send(line, response_timeout=600.0)
+            ctrl.send(line, response_timeout=waits[i])
             self._emit("log", f"    {line}")
             if not self._wait_done(ctrl, timeout=300.0):
                 self._emit("log", "! move did not finish in time — stopping")
@@ -2468,6 +2521,9 @@ class SprayApp(tk.Tk):
         total = sum(1 for k, _ in plan if k == "gcode")
         count = f"{len(stmts)} statement(s)" if stmts else f"{len(lines or [])} line(s)"
         eta = estimate_seconds(plan, self.pos[:2] if self.pos else None)
+        # Worked out here, on the main thread, for the same reason the cup is:
+        # self.pos is written by the queue pump.
+        waits = move_timeouts(plan, self.pos[:2] if self.pos else None)
         self._emit("log", f"-> {label}: {count}, {total} moves, ~{format_duration(eta)}")
         self._run_t0 = time.monotonic()
         # Read on the main thread; the worker must not touch Tk variables.
@@ -2498,7 +2554,7 @@ class SprayApp(tk.Tk):
                         while time.monotonic() < end and not self._abort.is_set():
                             time.sleep(0.05)
                         continue
-                    ctrl.send(str(payload), response_timeout=600.0)
+                    ctrl.send(str(payload), response_timeout=waits[idx])
                     done += 1
                     self._emit("state", f"move {done}/{total}")
                     self._emit("log", f"    {payload}")
@@ -2520,6 +2576,8 @@ class SprayApp(tk.Tk):
                     self._park_at_cup(ctrl, cup, start_z, tf)
             except (GrblError, TimeoutError, RuntimeError) as e:
                 self._emit("log", f"! {e}")
+                if isinstance(e, TimeoutError):
+                    self._recover_link(ctrl)
             finally:
                 self._io_lock.release()
                 if self._run_t0 is not None:
@@ -2554,6 +2612,43 @@ class SprayApp(tk.Tk):
         self._emit("log", f"-> returning to cup X{cup[0]:g} Y{cup[1]:g} Z{cup[2]:g}")
         if self._send_moves(ctrl, plan_cup_move(cur_z, cup, travel_feed)):
             self._emit("log", "at cup position.")
+
+    def _recover_link(self, ctrl: ShapeokoController) -> None:
+        """After a silent board: reopen the port and report what is there.
+
+        A board that reset and re-enumerated leaves a handle that still
+        accepts writes and never answers, which cannot be told apart from a
+        crash until the handle is dropped. Reopening identifies it and, when
+        it was a reset, recovers it - so the cost is a re-home rather than a
+        power cycle and a lost session.
+        """
+        self._emit("log", "reopening the port to see whether the board reset…")
+        try:
+            self._emit("log", f"  {ctrl.relink()}")
+        except Exception as e:  # noqa: BLE001 — surfaced to the user
+            self._emit("log", f"! could not reopen the port: {e}")
+            self._emit("log", "  nothing is answering — power-cycle the board")
+            self._emit("conn", "not connected")
+            self._emit("homed", False)
+            return
+        st = None
+        with suppress(Exception):
+            st = ctrl.read_status(timeout=1.0)
+        if st is None:
+            self._emit("log", "! still silent after reopening — power-cycle the board")
+            self._emit("homed", False)
+            return
+        self._emit("conn", f"connected: {ctrl.port}")
+        if st.state == "Alarm":
+            self._emit("homed", False)
+            self._emit("log", "  the board is alive but has lost its position: "
+                              "it reset mid-run. HOME again before running.")
+            return
+        self._emit("homed", True)
+        if st.mpos is not None:
+            self._emit("pos", st.mpos)
+        self._emit("log", "  the board is alive and still homed — an ack was "
+                          "lost rather than the board.")
 
     def _wait_done(self, ctrl: ShapeokoController, timeout: float) -> bool:
         """Confirm the machine is stopped, and refresh the position readout.
@@ -2593,6 +2688,11 @@ class SprayApp(tk.Tk):
                 ctrl.send_realtime(FEED_HOLD)
                 time.sleep(0.1)
                 ctrl.send_realtime(SOFT_RESET)
+                # The bytes are out; now release the worker whether or not the
+                # board answers them. Without this, a board that has stopped
+                # talking keeps the run "busy" until the ack timeout expires,
+                # and STOP cannot end a run or let you home again.
+                ctrl.interrupt()
             except Exception as e:  # noqa: BLE001 — best effort during an abort
                 self._emit("log", f"! stop: {e}")
         self._emit("log", "STOP — feed hold + soft reset sent. HOME AGAIN before running.")

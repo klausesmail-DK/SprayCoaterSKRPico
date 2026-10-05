@@ -1,0 +1,4 @@
+# run.bat must keep CRLF endings: cmd.exe mis-parses a batch file with bare
+# LF line endings, and git would otherwise normalise them on checkout.
+*.bat text eol=crlf
+*.sh  text eol=lf

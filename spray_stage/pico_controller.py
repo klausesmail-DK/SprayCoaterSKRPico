@@ -132,15 +132,45 @@ class Limits:
         return max(0.0, (v * v - v0 * v0) / (2.0 * self.accel(axis))) + 0.5
 
 
+# The Pico's USB vendor ID. Matching on this is the only port test that means
+# the same thing on every platform: macOS and Linux put something recognisable
+# in the device path, while Windows calls every port COMn and keeps the
+# identity in the description. Name matching alone found nothing at all on
+# Windows, so the port list came up empty and there was nothing to connect to.
+RP2040_VID = 0x2E8A
+
+_PORT_NAME_HINTS = ("usbmodem", "usbserial", "ttyacm", "ttyusb")
+_PORT_TEXT_HINTS = ("micropython", "pico", "board in fs mode", "usb serial device")
+
+
 def find_ports() -> list[PortInfo]:
-    """Likely stage ports. Same USB CDC heuristic as the GRBL version."""
-    keywords = ("usbmodem", "usbserial", "ttyacm", "ttyusb")
-    out: list[PortInfo] = []
+    """Likely stage ports, best candidates first.
+
+    Ranked rather than filtered, because the three platforms give away
+    different things. A vendor-ID match is certain; a telling device name or
+    description is a good guess; and if nothing matches at all every port is
+    offered anyway - on Windows a generic CDC driver can leave a port with no
+    identifying marks, and an empty chooser is a dead end where a wrong guess
+    is merely a wrong guess.
+    """
+    ranked: list[tuple[int, PortInfo]] = []
+    others: list[PortInfo] = []
     for p in list_ports.comports():
+        info = PortInfo(device=p.device, description=p.description or "")
         name = (p.device or "").lower()
-        if any(k in name for k in keywords):
-            out.append(PortInfo(device=p.device, description=p.description or ""))
-    return out
+        text = f"{p.description or ''} {getattr(p, 'manufacturer', None) or ''}".lower()
+        if getattr(p, "vid", None) == RP2040_VID:
+            ranked.append((0, info))
+        elif any(k in name for k in _PORT_NAME_HINTS):
+            ranked.append((1, info))
+        elif any(k in text for k in _PORT_TEXT_HINTS):
+            ranked.append((2, info))
+        else:
+            others.append(info)
+    if not ranked:
+        return others
+    ranked.sort(key=lambda r: r[0])
+    return [info for _rank, info in ranked]
 
 
 @dataclass
@@ -173,6 +203,10 @@ class PicoController:
         self._pos: tuple[float, float] | None = None
         self._jog_stop = threading.Event()
         self._jog_thread: threading.Thread | None = None
+        # Set by interrupt() to make a transaction that is waiting for an ack
+        # give up now. Cleared at the start of every transaction, so a stale
+        # interrupt can never stop the NEXT command - only the one in flight.
+        self._interrupt = threading.Event()
         self._last_feed = 0.0
 
     # -- lifecycle ---------------------------------------------------------
@@ -306,11 +340,15 @@ class PicoController:
         with self._lock:
             if self._serial is None:
                 raise RuntimeError("Not connected")
+            self._interrupt.clear()
             self._serial.reset_input_buffer()
             self.write_line(payload)
             deadline = time.monotonic() + response_timeout
             collected: list[str] = []
             while time.monotonic() < deadline:
+                if self._interrupt.is_set():
+                    raise RuntimeError(
+                        f"gave up waiting for the stage: {payload!r}")
                 resp = self.read_line(timeout=0.5)
                 if not resp:
                     continue
@@ -326,7 +364,50 @@ class PicoController:
                     continue
                 collected.append(resp)
             raise TimeoutError(
-                f"No stage response within {response_timeout}s for: {payload!r}")
+                f"No stage response within {response_timeout:g}s for "
+                f"{payload!r} - {self._link_report()}")
+
+    def _link_report(self) -> str:
+        """Is the board silent, or is the port itself gone?
+
+        From the GUI the two are the same event - a move that never acks -
+        but they call for different answers, and by the time anyone asks the
+        port has usually been reopened and the evidence lost. So gather it
+        here, at the moment a transaction gives up, and put it in the message
+        that reaches the log: a silent board holding an open port is firmware
+        or protocol, while an OSError or a port that has vanished is the USB
+        link, which no amount of firmware logic can catch.
+        """
+        ser = self._serial
+        if ser is None:
+            return "port closed"
+        try:
+            waiting = ser.in_waiting
+        except Exception as e:                    # noqa: BLE001 - diagnostic
+            return f"port unusable ({e!r}) - the USB link is gone"
+        try:
+            ser.write(b"?\n")
+            ser.flush()
+            answered = bool(ser.read(1))
+        except Exception as e:                    # noqa: BLE001 - diagnostic
+            return f"port write failed ({e!r}) - the USB link is gone"
+        if answered:
+            return (f"port alive and answers '?' with {waiting} byte(s) already "
+                    f"buffered - the ack was lost, not the board")
+        # Whether the device node is still enumerated is the one cheap fact
+        # that separates a crashed board from one that RESET: a reset board
+        # re-enumerates, and the handle still being held here keeps accepting
+        # writes and never answers again. Both present as plain silence.
+        try:
+            live = [p.device for p in find_ports()]
+        except Exception:                         # noqa: BLE001 - diagnostic
+            live = []
+        where = ("the device is still enumerated, so the board is wedged"
+                 if self.port in live else
+                 f"the device has GONE from {live or 'an empty port list'}, so "
+                 f"the board re-enumerated - it reset")
+        return (f"port open but silent, {waiting} byte(s) buffered, no reply to "
+                f"'?'; {where}")
 
     def _translate(self, payload: str) -> str | None:
         """GRBL in, stage dialect out. None means "nothing to send".
@@ -425,9 +506,61 @@ class PicoController:
             return
         self.stop_jog()
         self._pos = None
-        with self._lock:
-            self._serial.write(b"!\n")
-            self._serial.flush()
+        # NOT under the lock, for the same reason stop_jog() is not: a move
+        # in flight holds it for the whole traverse. A STOP that waited for
+        # the lock would arrive after the move it was meant to interrupt,
+        # and it would block its caller - the Tk main thread - for as long
+        # as the move lasts, which presents as a frozen program and leaves
+        # cutting the board's power as the only way out. Writing the byte
+        # straight at the port is safe precisely because the firmware polls
+        # stdin while it moves, looking for exactly this.
+        ser = self._serial
+        if ser is None:
+            raise RuntimeError("Not connected")
+        ser.write(b"!\n")
+        ser.flush()
+
+    def interrupt(self) -> None:
+        """Make a transaction that is waiting for an ack give up now.
+
+        STOP writes '!' straight at the port, which is what aborts the move.
+        But if the board has stopped talking altogether - a wedged USB stack,
+        a reset that ate the command - no ack is coming and no abort reply
+        will arrive either, and the worker would sit in its read until the
+        timeout expired. The run would stay 'busy' all that time: buttons
+        disabled, no way to home, nothing to do but kill the program. This
+        releases it immediately.
+        """
+        self._interrupt.set()
+
+    def relink(self) -> str:
+        """Drop the port and open it again, and say what came back.
+
+        For the one failure nothing else can tell apart: a board that crashed
+        versus a board that reset. A reset re-enumerates the USB device, and
+        the handle from before survives that - writes still succeed, nothing
+        ever arrives - so both present as a silent port. The only way to ask
+        is to let go of the handle and open a fresh one.
+
+        Worth doing automatically, because when it was a reset this recovers
+        the session: the cost is a re-home instead of a power cycle.
+        """
+        was = self.port
+        self.close()
+        self._pos = None                  # unknown either way from here on
+        time.sleep(0.5)                   # let the node settle if it is returning
+        try:
+            live = [p.device for p in find_ports()]
+        except Exception:                 # noqa: BLE001 - diagnostic
+            live = []
+        if was not in live and len(live) == 1:
+            # Came back under a different name. Following it is the point: the
+            # operator should not have to work out that usbmodem101 became
+            # usbmodem102 before they can carry on.
+            self.port = live[0]
+        self.connect()
+        moved = "" if self.port == was else f" (it came back as {self.port})"
+        return f"port reopened{moved}: {self.banner or 'no banner'}"
 
     def read_status(self, timeout: float = 1.0) -> Status | None:
         with self._lock:
