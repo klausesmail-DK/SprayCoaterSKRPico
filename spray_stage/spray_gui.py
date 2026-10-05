@@ -1283,7 +1283,19 @@ class SprayApp(tk.Tk):
                     self.log.insert("end", f"{payload}\n")
                     self.log.see("end")
                 elif kind == "state":
-                    self.lbl_state.configure(text=str(payload))
+                    # Repaints in the normal colour, which is what clears a
+                    # previous run's red banner when the next one starts.
+                    self.lbl_state.configure(text=str(payload), foreground=FG)
+                elif kind == "state_bad":
+                    self.lbl_state.configure(text=str(payload), foreground=BAD_FG)
+                elif kind == "alert":
+                    # A spoiled consumable is worth interrupting for. The log
+                    # scrolls - by the end of a script run the line that
+                    # mattered is hundreds of lines up - and the operator is
+                    # at the machine, not reading the screen. This blocks the
+                    # Tk loop until it is dismissed, which is the point.
+                    title, body = payload  # type: ignore[misc]
+                    messagebox.showwarning(title, body)
                 elif kind == "conn":
                     self.lbl_conn.configure(text=str(payload))
                 elif kind == "homed":
@@ -2599,6 +2611,10 @@ class SprayApp(tk.Tk):
                 return
             self.has_run = True
             done = 0
+            # (why it ended, whether to interrupt the operator) or None when
+            # the pattern ran to the end.
+            failed: tuple[str, bool] | None = None
+            sprayed = False      # the pattern finished; only the cup trip left
             # Own the port outright; the poller backs off while we hold this.
             self._io_lock.acquire()
             try:
@@ -2626,6 +2642,7 @@ class SprayApp(tk.Tk):
                 for idx, (kind, payload) in enumerate(plan):
                     if self._abort.is_set():
                         self._emit("log", "aborted.")
+                        failed = ("stopped from the STOP button", False)
                         break
                     if kind == "note":
                         self._emit("log", str(payload))
@@ -2652,11 +2669,13 @@ class SprayApp(tk.Tk):
                         continue
                     if not self._wait_done(ctrl, timeout=900.0):
                         self._emit("log", "! move did not finish in time — stopping")
+                        failed = ("a move never reported itself finished", True)
                         break
                 else:
                     # Time the pattern itself, before the trip back to the cup.
                     spray_s = time.monotonic() - (self._run_t0 or time.monotonic())
                     self._emit("log", f"run complete in {spray_s:.1f} s.")
+                    sprayed = True
                     self._park_at_cup(ctrl, cup, start_z, tf)
             # OSError is the one that matters here: pyserial raises
             # SerialException, which subclasses OSError and NOT RuntimeError,
@@ -2669,6 +2688,7 @@ class SprayApp(tk.Tk):
             # an OSError too, so it is still covered.)
             except (GrblError, OSError, RuntimeError) as e:
                 self._emit("log", f"! {e}")
+                failed = (str(e) or e.__class__.__name__, True)
                 if isinstance(e, OSError):
                     # Covers both a board that stopped answering and a port
                     # that was yanked out from under us.
@@ -2681,7 +2701,42 @@ class SprayApp(tk.Tk):
                     self._run_t0 = None
                     self._emit("elapsed", f"{elapsed:.1f} s")
                     self._emit("log", f"total elapsed {elapsed:.1f} s (including return to cup)")
-                self._emit("state", "idle")
+                if failed is None:
+                    self._emit("state", "idle")
+                elif sprayed:
+                    # The pattern itself finished; only the trip back to the
+                    # cup did not. The slide is fine - say that plainly rather
+                    # than crying wolf, because an operator who is told to
+                    # discard a good slide once will discount the warning the
+                    # next time it is real.
+                    why, _loud = failed
+                    self._emit("log", f"-- the pattern COMPLETED; the return to the "
+                                      f"cup did not ({why}). The coating is fine. "
+                                      f"Check where the head is parked.")
+                    self._emit("state_bad", "sprayed OK — head may not be at the cup")
+                else:
+                    why, loud = failed
+                    where = f"move {done} of {total}"
+                    bar = "!" * 60
+                    for line in (
+                        "", bar,
+                        f"!!  RUN DID NOT COMPLETE — stopped at {where}",
+                        f"!!  {why}",
+                        "!!  The coating is partial. DISCARD THIS CONSUMABLE",
+                        "!!  and start again on a fresh one.",
+                        bar, "",
+                    ):
+                        self._emit("log", line)
+                    self._emit("state_bad",
+                               f"RUN INCOMPLETE at {where} — DISCARD the consumable")
+                    if loud:
+                        self._emit("alert", (
+                            "Run did not complete — discard the consumable",
+                            f"The run stopped partway, at {where}.\n\n{why}\n\n"
+                            f"The coating on this consumable is partial. Discard it "
+                            f"and start the next run on a fresh one.\n\n"
+                            f"The machine itself is fine; the log says whether it "
+                            f"is still homed."))
                 self._emit("buttons")
 
         self._spawn(work)
