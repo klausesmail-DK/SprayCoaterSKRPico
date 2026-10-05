@@ -25,10 +25,14 @@ opens the port and then gets no reply, which reads as a dead board.
 On **Windows**, `run.bat` does what `run.sh` does, and the board commands are
 the same code rather than a parallel set of scripts:
 
-    run.bat
+    .\run.bat
     .venv\Scripts\python -m spray_stage.board push
     .venv\Scripts\python -m spray_stage.board check
     .venv\Scripts\python -m spray_stage.board reset
+
+The leading `.\` is for PowerShell, which does not run anything from the
+current directory without being told where it is. In `cmd` plain `run.bat`
+works too.
 
 Nothing else differs. Python 3.11+ from python.org (the installer brings the
 Tkinter the GUI needs), the board appears as `COMn` instead of
