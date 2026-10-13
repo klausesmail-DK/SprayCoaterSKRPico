@@ -2,7 +2,7 @@
   "travel_feed": "2400",
   "run_mode": "script",
   "scripts": {
-    "Test": "LOOP(1,2,3,4,5)=3"
+    "Test": "LOOP(1,2,3,4,5)=2\nLOOP(6,7,8,9)=1"
   },
   "active_script": "Test",
   "cup": [
@@ -73,6 +73,58 @@
       "reps": 1,
       "pause_s": 0.0,
       "dwell_s": 4.0,
+      "feed_end": 0.0,
+      "gradient_mode": "velocity"
+    },
+    {
+      "kind": "dot",
+      "axis": "Y",
+      "start_x": -41.25,
+      "start_y": -78.0,
+      "length": 20.0,
+      "feed": 500.0,
+      "reps": 1,
+      "pause_s": 0.0,
+      "dwell_s": 1.0,
+      "feed_end": 0.0,
+      "gradient_mode": "thickness"
+    },
+    {
+      "kind": "dot",
+      "axis": "Y",
+      "start_x": -26.25,
+      "start_y": -87.0,
+      "length": 20.0,
+      "feed": 500.0,
+      "reps": 1,
+      "pause_s": 0.0,
+      "dwell_s": 1.0,
+      "feed_end": 0.0,
+      "gradient_mode": "thickness"
+    },
+    {
+      "kind": "dot",
+      "axis": "Y",
+      "start_x": -11.25,
+      "start_y": -78.0,
+      "length": 20.0,
+      "feed": 500.0,
+      "reps": 1,
+      "pause_s": 0.0,
+      "dwell_s": 1.0,
+      "feed_end": 0.0,
+      "gradient_mode": "thickness"
+    },
+    {
+      "kind": "dot",
+      "axis": "Y",
+      "start_x": -85.75,
+      "start_y": -82.596,
+      "length": 30.0,
+      "feed": 1000.0,
+      "reps": 1,
+      "pause_s": 0.0,
+      "dwell_s": 0.1,
       "feed_end": 0.0,
       "gradient_mode": "velocity"
     }

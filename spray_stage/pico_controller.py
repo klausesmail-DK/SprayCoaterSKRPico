@@ -71,6 +71,13 @@ _WORD_RE = re.compile(r"([A-Z])\s*(-?\d*\.?\d+)")
 _NOOP_WORDS = {"G17", "G21", "G40", "G49", "G54", "G80", "G90", "G94",
                "M3", "M4", "M5", "M7", "M8", "M9", "M30"}
 
+# pyserial blocks on write by default, with no timeout at all. When the far
+# end of a CDC port stops draining its endpoint, a write never returns - and
+# STOP writes from the Tk main thread, so the whole window freezes, which is
+# exactly the failure STOP exists to get you out of. Two seconds is far
+# longer than any healthy write to a 115200 port needs.
+WRITE_TIMEOUT_S = 2.0
+
 JOG_CHUNK_MM = 1.0        # continuous-jog granularity; also the stop latency
 JOG_CHUNK_MIN = 0.2
 
@@ -238,7 +245,8 @@ class PicoController:
         if self.is_open:
             return
         self._serial = serial.Serial(port=self.port, baudrate=self.baudrate,
-                                     timeout=self.timeout)
+                                     timeout=self.timeout,
+                                     write_timeout=WRITE_TIMEOUT_S)
         # A board that has just been reset is still printing its driver
         # configuration, a dozen lines fed by slow UART reads. Give each
         # probe long enough to outlast that chatter and still find the

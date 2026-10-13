@@ -1236,6 +1236,37 @@ _poll = None
 BANNER = "PicoStage 1.0 ['?' for status, '$H' to home, '$$' for limits]"
 
 
+def check_drivers():
+    """Have the drivers kept the configuration they were given at boot?
+
+    The TMC2209 holds it in volatile registers, written once by setup(). A dip
+    on the driver rail - a pump or a spray-head solenoid switching is the
+    obvious candidate - brings one back at power-on defaults, where
+    pdn_disable and mstep_reg_select are clear: the UART settings are ignored,
+    the run current comes from VREF and the microstep mode from the MS pins,
+    which on this board are strapped for addressing rather than for 1/16.
+
+    What follows is the worst failure this machine has. The PIO still clocks
+    out its exact step count, the FIFO still reports the move finished, the
+    firmware still acks and still advances its idea of where the carriage is -
+    and the carriage has not moved, or has moved the wrong distance. The log
+    reads like a flawless run and the slide comes out blank.
+
+    Bits 6 and 7 of GCONF are the tell. Returns the drivers that had lost it,
+    having reconfigured their axes; empty means all is well.
+    """
+    lost = []
+    for a in AX.values():
+        for m in a.motors:
+            g = read_reg(GCONF, m.addr)
+            if g is None or not (g & (1 << 7)) or not (g & (1 << 6)):
+                lost.append("%s:%d" % (a.name, m.addr))
+    for a in AX.values():
+        if any(n.split(":")[0] == a.name for n in lost):
+            a.configure()
+    return lost
+
+
 def _words(line):
     out = {}
     key, num = None, ""
@@ -1287,6 +1318,17 @@ def _execute(line):
             AX["X"].lo(), AX["X"].hi(), AX["Y"].lo(), AX["Y"].hi(),
             MAX_FEED, TRAVEL_FEED, MIN_FEED,
             AX["X"].accel, AX["Y"].accel, START_MMS)
+    if line == "$C":
+        lost = check_drivers()
+        if not lost:
+            return "ok"
+        # Whatever the machine did while a driver was unconfigured, it was not
+        # what it was asked to do - so the position is a guess now, and saying
+        # so is the whole point of noticing.
+        for a in AX.values():
+            a.pos = None
+        return ("error: drivers lost their configuration (%s); reconfigured, "
+                "but position is unknown - home again" % ",".join(lost))
     if line == "M17":
         for a in AX.values():
             a.enable(True)

@@ -2602,6 +2602,27 @@ class SprayApp(tk.Tk):
             # Own the port outright; the poller backs off while we hold this.
             self._io_lock.acquire()
             try:
+                # Before anything moves: do the drivers still hold the
+                # configuration they were given at boot? One that came back
+                # from a dip on its rail acks every move and moves nothing,
+                # so a run can read as flawless and spray nothing at all.
+                # A few UART reads, once per run.
+                try:
+                    ctrl.send("$C", response_timeout=10.0)
+                except GrblError as e:
+                    if "unknown command" in str(e).lower():
+                        # Older firmware on the board. Worth one line rather
+                        # than refusing to run: the check is an improvement,
+                        # not a requirement, and a host that will not drive a
+                        # board it can otherwise drive is its own fault.
+                        self._emit("log", "note: this board's firmware has no "
+                                          "driver check — ./push.sh to get it")
+                    else:
+                        self._emit("log", f"! {e}")
+                        self._emit("log", "nothing was sprayed — this consumable "
+                                          "is untouched. HOME, then run again.")
+                        self._emit("homed", False)
+                        return
                 for idx, (kind, payload) in enumerate(plan):
                     if self._abort.is_set():
                         self._emit("log", "aborted.")
@@ -2776,25 +2797,36 @@ class SprayApp(tk.Tk):
         return False
 
     def _stop(self) -> None:
+        """Abort now, doing no serial I/O on the Tk thread.
+
+        Only the cheap things happen here: the abort flag, and interrupt(),
+        which sets an Event and releases the worker whether or not the board
+        ever answers. The bytes go out on a thread of their own, because a
+        write to a port whose far end has stopped reading blocks until the
+        write timeout - and this method runs on the main loop, so a blocking
+        write freezes the entire window. STOP freezing the program is the one
+        failure STOP must never have.
+        """
         self._abort.set()
         self._jogging = False
         ctrl = self.ctrl
-        if ctrl is not None and ctrl.is_open:
+        self._emit("log", "STOP — aborting. HOME AGAIN before running.")
+        self._emit("homed", False)
+        if ctrl is None or not ctrl.is_open:
+            return
+        with suppress(Exception):
+            ctrl.interrupt()      # an Event, not a write: safe here
+
+        def shout() -> None:
             try:
-                # Realtime bytes bypass the line protocol by design, so this is
-                # safe to send while the worker thread is mid-read.
                 ctrl.send_realtime(FEED_HOLD)
                 time.sleep(0.1)
                 ctrl.send_realtime(SOFT_RESET)
-                # The bytes are out; now release the worker whether or not the
-                # board answers them. Without this, a board that has stopped
-                # talking keeps the run "busy" until the ack timeout expires,
-                # and STOP cannot end a run or let you home again.
-                ctrl.interrupt()
+                self._emit("log", "  feed hold + soft reset reached the board")
             except Exception as e:  # noqa: BLE001 — best effort during an abort
-                self._emit("log", f"! stop: {e}")
-        self._emit("log", "STOP — feed hold + soft reset sent. HOME AGAIN before running.")
-        self._emit("homed", False)
+                self._emit("log", f"! stop: the board did not take it ({e})")
+
+        threading.Thread(target=shout, daemon=True).start()
 
     def _on_close(self) -> None:
         # Last chance to keep what was dialled in. Everything else that
