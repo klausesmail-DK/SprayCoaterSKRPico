@@ -72,6 +72,12 @@ KIND_BY_LABEL = {label: key for key, label in KINDS.items()}
 GRADIENT_MODES = {"velocity": "Velocity", "thickness": "Thickness"}
 GRADIENT_MODE_BY_LABEL = {label: key for key, label in GRADIENT_MODES.items()}
 
+# A dropped USB link while idle. One failed status read can be a hiccup;
+# three in a row is the cable, and then it is worth saying so and trying to
+# get it back rather than polling a handle that will never answer again.
+LINK_FAILS_BEFORE_LOST = 3
+LINK_RETRY_S = 3.0
+
 FEED_HOLD = 0x21  # '!'
 SOFT_RESET = 0x18  # Ctrl-X
 
@@ -819,6 +825,7 @@ class SprayApp(tk.Tk):
         self._poll_stop = threading.Event()
         self._poller: threading.Thread | None = None
         self._jogging = False  # a hold-mode jog is in flight
+        self._link_lost = False  # USB dropped while idle; the poller is retrying
         self.recipe_path: Path | None = None  # file behind Save (vs Save as…)
         self.scripts: dict[str, str] = {}  # named scripts saved with the recipe
         self.ctrl_lines: list[SprayLine] = []  # the control script, run by Ctrl RUN
@@ -1289,6 +1296,12 @@ class SprayApp(tk.Tk):
                     x, y, z = payload  # type: ignore[misc]
                     self.pos = (x, y, z)
                     self.lbl_pos.configure(text=f"X {x:8.2f}   Y {y:8.2f}")
+                elif kind == "port":
+                    # Set here rather than on the worker thread: Tk variables
+                    # belong to the thread that owns the widget.
+                    self.port_var.set(str(payload))
+                    self.port_box.configure(
+                        values=[p.device for p in find_ports()])
                 elif kind == "elapsed":
                     self.lbl_elapsed.configure(text=str(payload))
                 elif kind == "buttons":
@@ -1711,11 +1724,24 @@ class SprayApp(tk.Tk):
         self._poll_stop.clear()
 
         def work() -> None:
+            fails = 0
+            next_try = 0.0
             while not self._poll_stop.is_set():
                 ctrl = self.ctrl
                 # The job worker owns the port while it runs; it reports
-                # position itself from _wait_done.
-                if ctrl is None or not ctrl.is_open or self._busy():
+                # position itself from _wait_done and has its own recovery.
+                if ctrl is None or self._busy():
+                    time.sleep(0.25)
+                    continue
+                if self._link_lost:
+                    if time.monotonic() < next_try:
+                        time.sleep(0.25)
+                        continue
+                    next_try = time.monotonic() + LINK_RETRY_S
+                    if self._relink_once(ctrl):
+                        fails = 0
+                    continue
+                if not ctrl.is_open:
                     time.sleep(0.25)
                     continue
                 if not self._io_lock.acquire(blocking=False):
@@ -1723,7 +1749,26 @@ class SprayApp(tk.Tk):
                     continue
                 try:
                     st = ctrl.read_status(timeout=0.3)
-                except (OSError, RuntimeError):
+                    fails = 0
+                except OSError as e:
+                    # The PORT failed, which is not the same as a board that
+                    # did not answer in time: read_status returns None for
+                    # that and this never fires. Until now the poller
+                    # swallowed this and kept asking a handle that would
+                    # never answer again, so the window went on saying
+                    # "connected" over a frozen position readout.
+                    st = None
+                    fails += 1
+                    if fails >= LINK_FAILS_BEFORE_LOST:
+                        self._link_lost = True
+                        next_try = 0.0
+                        self._emit("conn", "LINK LOST — reconnecting…")
+                        self._emit("homed", False)
+                        self._emit("log", f"! the USB link dropped ({e}); "
+                                          f"retrying every {LINK_RETRY_S:g}s. "
+                                          f"The board keeps its position, so "
+                                          f"this may come back without a home.")
+                except RuntimeError:
                     st = None
                 finally:
                     self._io_lock.release()
@@ -1861,8 +1906,24 @@ class SprayApp(tk.Tk):
                 # says immediately whether the board was still booting, the
                 # port was contested, or nothing answered at all.
                 t0 = time.monotonic()
-                ctrl = ShapeokoController(port)
-                ctrl.connect()
+                try:
+                    ctrl = ShapeokoController(port)
+                    ctrl.connect()
+                except OSError as first:
+                    # The name in the box was found when the GUI started. A
+                    # board that was unplugged, power-cycled or dropped off
+                    # the bus comes back under a NEW name - usbmodem102 where
+                    # it was 101 - and Connect then fails for ever against a
+                    # port that no longer exists. That reads as a dead board
+                    # rather than a renamed one, and the fix (press Rescan)
+                    # is not discoverable from the error. So look again.
+                    fresh = [q.device for q in find_ports() if q.device != port]
+                    if not fresh:
+                        raise
+                    self._emit("log", f"! {port} is gone; trying {fresh[0]}")
+                    ctrl = ShapeokoController(fresh[0])
+                    ctrl.connect()
+                    self._emit("port", fresh[0])
                 t_open = time.monotonic() - t0
                 self.ctrl = ctrl
                 self._emit("log", f"connected to {port}: {ctrl.banner}")
@@ -1877,7 +1938,8 @@ class SprayApp(tk.Tk):
                     f"envelope from board: X {self.env.lo_x:g}…{self.env.hi_x:g}, "
                     f"Y {self.env.lo_y:g}…{self.env.hi_y:g}",
                 )
-                self._emit("conn", f"connected: {port}")
+                self._link_lost = False
+                self._emit("conn", f"connected: {ctrl.port}")
                 # GRBL reset when the port opened, so connecting always meant
                 # losing the home reference. MicroPython does not reset on
                 # DTR: if the stage was homed before the GUI was launched, it
@@ -1905,6 +1967,7 @@ class SprayApp(tk.Tk):
 
     def _disconnect(self) -> None:
         self._poll_stop.set()
+        self._link_lost = False
         self._jogging = False
         if self.ctrl is not None:
             self.ctrl.close()
@@ -2612,6 +2675,41 @@ class SprayApp(tk.Tk):
         self._emit("log", f"-> returning to cup X{cup[0]:g} Y{cup[1]:g} Z{cup[2]:g}")
         if self._send_moves(ctrl, plan_cup_move(cur_z, cup, travel_feed)):
             self._emit("log", "at cup position.")
+
+    def _relink_once(self, ctrl: ShapeokoController) -> bool:
+        """One quiet attempt to bring a dropped link back while idle.
+
+        Deliberately not _recover_link, which narrates every step: this runs
+        every few seconds for as long as the cable is out, and a running
+        commentary would bury the log it is written into. One line when the
+        link goes, one when it returns.
+
+        A board that only lost its USB keeps running and keeps its position,
+        so a restored link usually needs no re-home - and saying which it was
+        is the difference between carrying on and starting the morning again.
+        """
+        if not self._io_lock.acquire(blocking=False):
+            return False
+        try:
+            ctrl.relink()
+            st = ctrl.read_status(timeout=1.0)
+        except Exception:  # noqa: BLE001 — still gone; the poller tries again
+            return False
+        finally:
+            self._io_lock.release()
+        if st is None:
+            return False
+        self._link_lost = False
+        self._emit("conn", f"connected: {ctrl.port}")
+        self._emit("port", ctrl.port)
+        homed = st.state != "Alarm"
+        self._emit("homed", homed)
+        if st.mpos is not None:
+            self._emit("pos", st.mpos)
+        self._emit("log", f"link restored on {ctrl.port}"
+                   + (" — still homed, carry on" if homed
+                      else " — the board reset, so HOME again"))
+        return True
 
     def _recover_link(self, ctrl: ShapeokoController) -> None:
         """After a silent board: reopen the port and report what is there.
